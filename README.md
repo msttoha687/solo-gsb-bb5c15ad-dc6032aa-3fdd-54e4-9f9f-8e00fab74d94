@@ -24,6 +24,14 @@
   服务端在**同一个 SQLite 立即事务**中完成「校验链尾 → 查重随机数 → 追加事件 →
   推进链尾」，全程串行。链尾不匹配（过期/竞争请求）或随机数重放一律返回
   **`409 Conflict`**，不写入任何数据，因而不可能产生分叉。
+- **批量移交（同一接收方）**：同一批文件对应的多条交接链可一次移交：
+  `POST /handover-batches` 携带统一的 `receiver` 与 **2～20 个**条目（每条链
+  各自的 `chain_id`、`tail_hash`、`nonce`），**同批 `chain_id` 不得重复**。
+  服务端在**同一个 SQLite 立即事务**内按请求顺序对每条链复用单链移交的校验
+  （链存在 → 无生效封存 → 链尾匹配 → 随机数查重）与哈希规则，逐链追加事件并
+  推进各链尾（每条链的交出方仍按其各自的当前持有人确定）；**任一链不存在、
+  链尾过期、随机数重放或处于封存生效期时整批回滚，任何链都不新增事件**。
+  成功响应按请求顺序返回每条链的新序号 `seq` 与新链尾 `tail_hash`。
 - **待接收移交（邀约确认）**：除直接移交外，持有人也可先发起邀约、由接收方确认：
   1. **发起邀约** `POST /offers`：携带当前 `tail_hash`、指定的 `receiver`、
      有效期 `expires_in_seconds`（秒，上限 7 天）与一次性确认码
@@ -104,22 +112,23 @@
      匹配返回 **409**（`tail_mismatch`）；**同一链同时只能有一个生效封存**，
      重复封存返回 **409**（`chain_seal_active`，由部分唯一索引
      `uq_active_seal_per_chain` 与立即事务共同兜底）。
-  2. **封存生效期间的冻结语义**：直接移交 `POST /handovers`，以及邀约的
-     创建 `POST /offers`、替换 `POST /offers/{id}/replace`、确认
-     `POST /offers/{id}/confirm`，都在各自**现有 SQLite 立即事务内的任何写入
-     之前**检查封存，命中即返回 **409 `chain_on_hold`**，**不写入事件、不写入
-     或替换邀约**。封存创建与这些操作共用同一把写锁与 `BEGIN IMMEDIATE`
+  2. **封存生效期间的冻结语义**：直接移交 `POST /handovers`、批量移交
+     `POST /handover-batches`，以及邀约的创建 `POST /offers`、替换
+     `POST /offers/{id}/replace`、确认 `POST /offers/{id}/confirm`，都在各自
+     **现有 SQLite 立即事务内的任何写入之前**检查封存，命中即返回
+     **409 `chain_on_hold`**，**不写入事件、不写入或替换邀约**（批量移交则
+     整批不写）。封存创建与这些操作共用同一把写锁与 `BEGIN IMMEDIATE`
      语义，并发时只有一方成功（封存先提交则操作被拒；操作先提交则链尾推进、
      封存因 `tail_mismatch` 失败）。
-     （注：按需求范围，仅上述四类操作被冻结；邀约撤销与见证人表态不推进链、
+     （注：按需求范围，仅上述五类操作被冻结；邀约撤销与见证人表态不推进链、
      不产生新邀约，不在冻结之列。）
   3. **提前解封** `POST /seals/{seal_id}/release`：凭一次性解封码在同一立即
      事务内把封存置为 `released` 并记录 `released_at`，解封同样**不动哈希链**，
-     解封后四类操作立即恢复。解封码错误返回 **403**
+     解封后五类操作立即恢复。解封码错误返回 **403**
      （`release_code_mismatch`）；封存不存在 **404**；重复解封 **409**
      （`seal_already_released`）。
   4. **过期自动失效**：封存有效期由创建时固定的 `expires_at` 决定，到期**无需
-     任何写操作**即自动失效——读写事务按当前时间实时派生 `expired` 状态，四类
+     任何写操作**即自动失效——读写事务按当前时间实时派生 `expired` 状态，五类
      操作随之自然恢复；之后可重新创建封存（创建时同链已过期的旧封存会在同一
      事务内物化为 `expired` 终态）。对已过期封存调用解封返回 **409**
      （`seal_expired`）。
@@ -270,6 +279,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `POST` | `/chains` | 创建交接链（文件摘要 + 首位持有人） |
 | `POST` | `/handovers` | 执行一次移交（链尾哈希 + 接收方 + 一次性随机数） |
+| `POST` | `/handover-batches` | 批量移交：同一批文件的 2～20 条链一次移交给同一接收方（同批 chain_id 不重复；任一链失败整批回滚，按请求顺序返回各链新序号与新链尾） |
 | `POST` | `/offers` | 发起邀约（链尾 + 接收方 + 有效期 + 一次性确认码；可选撤销码，凭码可撤销/替换；可选 2～5 名见证人与阈值） |
 | `POST` | `/offers/{offer_id}/confirm` | 接收方凭确认码确认，原子追加移交事件（见证模式须无拒绝且同意数达阈值） |
 | `POST` | `/offers/{offer_id}/cancel` | 凭一次性撤销码撤销邀约（仅 pending 且链尾未推进/未过期/无拒绝；错码 403，终态或无撤销码 409；不改链） |
@@ -295,8 +305,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 **409** —— `tail_mismatch`（链尾不匹配/已推进，邀约派生状态为 `terminated`；
 创建封存时链尾不匹配同样返回此码）、
 `nonce_replay`（随机数重放）、
-`chain_on_hold`（链条处于争议封存生效期：直接移交与邀约的创建、替换、确认
-一律被冻结，不写事件或新邀约）、
+`chain_on_hold`（链条处于争议封存生效期：直接移交、批量移交与邀约的创建、
+替换、确认一律被冻结，不写事件或新邀约；批量移交整批不写）、
 `chain_seal_active`（该链已有生效封存，同一链同时只能有一个；并发封存落败
 也返回此码）、
 `seal_already_released`（封存已提前解封，不能重复解封）、
@@ -320,6 +330,8 @@ cancelled / replaced / rejected / expired / terminated，或创建时未提供�
 `release_code_mismatch`（封存解封码错误）；
 **400** —— `too_many_seqs`（批量证明去重后超过 20 个事件序号）、
 `too_few_seqs`（批量证明未提供任何有效序号）、
+`duplicate_chain_id`（批量移交请求中同批 `chain_id` 重复；注：条目数不在
+2～20 范围内等请求体结构错误由 FastAPI 返回 422）、
 `invalid_time_range`（审计检索的 `created_from`/`created_to` 非合法 ISO-8601
 时间，或 `created_from` 晚于 `created_to`）、
 `role_requires_holder`（审计检索提供了 `role` 却未提供 `holder`）、
@@ -365,6 +377,46 @@ curl -s http://localhost:8000/chains/ab12...
 
 # 6) 完整性校验（正常：valid=true）
 curl -s http://localhost:8000/chains/ab12.../verify
+```
+
+### 批量移交示例（同一批文件的多条链 → 同一接收方）
+
+```bash
+# 1) 同一批文件对应两条链（chain A、chain B），先各自查到当前链尾
+curl -s http://localhost:8000/chains/aaaa...   # 取 tail_hash，记为 <A链尾>
+curl -s http://localhost:8000/chains/bbbb...   # 取 tail_hash，记为 <B链尾>
+
+# 2) 一次请求把两条链都移交给 bob：统一 receiver + 每条链各自的
+#    chain_id / tail_hash / nonce（同批 chain_id 不得重复，nonce 各链独立）
+curl -s -X POST http://localhost:8000/handover-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"receiver":"bob","items":[
+        {"chain_id":"aaaa...","tail_hash":"<A链尾>","nonce":"batch-01-a"},
+        {"chain_id":"bbbb...","tail_hash":"<B链尾>","nonce":"batch-01-b"}]}'
+# 201 响应按请求顺序给出每条链的新序号与新链尾：
+# {"receiver":"bob","results":[
+#   {"chain_id":"aaaa...","seq":3,"tail_hash":"<A新链尾>"},
+#   {"chain_id":"bbbb...","seq":5,"tail_hash":"<B新链尾>"}]}
+
+# 3) 原子性：任一链校验失败（链不存在 404；链尾过期 409 tail_mismatch；
+#    随机数重放 409 nonce_replay；处于封存生效期 409 chain_on_hold），
+#    整批回滚——任何链都不新增事件，其余链的链尾也保持不动
+curl -i -X POST http://localhost:8000/handover-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"receiver":"carol","items":[
+        {"chain_id":"aaaa...","tail_hash":"<A新链尾>","nonce":"batch-02-a"},
+        {"chain_id":"bbbb...","tail_hash":"<过期链尾>","nonce":"batch-02-b"}]}'
+# HTTP/1.1 409 Conflict
+# {"error":"tail_mismatch","detail":"链 bbbb... 的链尾哈希不匹配：…（本次批量移交整体失败，未写入任何事件）"}
+# 此时 aaaa... 链也不会新增事件：修正 bbbb... 的链尾后整体重试即可
+
+# 4) 同批 chain_id 重复 → 400 duplicate_chain_id；条目数不在 2～20 → 422
+curl -i -X POST http://localhost:8000/handover-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"receiver":"carol","items":[
+        {"chain_id":"aaaa...","tail_hash":"<A新链尾>","nonce":"batch-03-a"},
+        {"chain_id":"aaaa...","tail_hash":"<A新链尾>","nonce":"batch-03-b"}]}'
+# {"error":"duplicate_chain_id","detail":"同批 chain_id 不得重复：…"}
 ```
 
 ### 待接收移交（邀约确认）示例
@@ -559,11 +611,17 @@ curl -i -X POST http://localhost:8000/chains/ab12.../seals \
   -d '{"tail_hash":"<当前链尾>","reason":"再次封存",
        "expires_in_seconds":60,"release_code":"other"}'
 
-# 3) 生效期间四类操作一律 409 chain_on_hold，且不写事件/新邀约：
+# 3) 生效期间五类操作一律 409 chain_on_hold，且不写事件/新邀约：
 #    直接移交
 curl -i -X POST http://localhost:8000/handovers \
   -H 'Content-Type: application/json' \
   -d '{"chain_id":"ab12...","tail_hash":"<当前链尾>","receiver":"bob","nonce":"n-9"}'
+#    批量移交（整批失败，任何链都不新增事件）
+curl -i -X POST http://localhost:8000/handover-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"receiver":"bob","items":[
+        {"chain_id":"ab12...","tail_hash":"<当前链尾>","nonce":"batch-9-a"},
+        {"chain_id":"cd34...","tail_hash":"<另一链链尾>","nonce":"batch-9-b"}]}'
 #    创建邀约 / 替换邀约 / 确认邀约 同样返回 409 chain_on_hold
 curl -i -X POST http://localhost:8000/offers \
   -H 'Content-Type: application/json' \
@@ -587,7 +645,7 @@ curl -s -X POST http://localhost:8000/seals/3af2.../release \
 #    解封码错误   -> 403 release_code_mismatch（封存保持 active）
 #    重复解封     -> 409 seal_already_released
 #    封存已过期   -> 409 seal_expired（到期已自动失效，无需解封）
-# 过期后无需任何操作，四类操作自动恢复，且可重新创建封存。
+# 过期后无需任何操作，五类操作自动恢复，且可重新创建封存。
 
 # 7) 链尾不是最新 -> 409 tail_mismatch（仅当前持有人可凭最新链尾封存）
 ```
@@ -749,7 +807,11 @@ curl -i "http://localhost:8000/chains/ab12.../events/proof?seq=0&seq=1&...&seq=2
 ## 防分叉与并发保证
 
 1. 每次追加都在 `BEGIN IMMEDIATE` 事务内完成，且进程内写操作由互斥锁串行化；
-   「读链尾 → 比对 → 插入 → 推进」是一个原子步骤。邀约确认同样如此：
+   「读链尾 → 比对 → 插入 → 推进」是一个原子步骤。**批量移交
+   （`POST /handover-batches`）把 2～20 条链的「逐链校验 → 逐链追加 → 推进
+   各链尾」全部放进同一个立即事务**：任一链校验失败（链不存在、链尾过期、
+   随机数重放、封存生效）整批回滚，任何链都不新增事件，绝不存在部分链推进的
+   半批次结果。邀约确认同样如此：
    「验码 → 未过期 → 未使用 → 未撤销 → 链尾匹配 → （见证模式）无拒绝且同意数
    达阈值 → 追加事件 → 置 accepted」全部在同一立即事务内，任一校验失败即整体
    回滚。**邀约撤销、原子替换、接收方确认与见证人表态共用同一把写锁与同一立即
@@ -773,7 +835,7 @@ curl -i "http://localhost:8000/chains/ab12.../events/proof?seq=0&seq=1&...&seq=2
    与 `UNIQUE(offer_id, token_digest)`，且表态以「行已存在 decision」判定一次性，
    重复使用令牌不可能产生第二条表态。**争议封存由 `chain_seals` 表上的部分唯一
    索引 `uq_active_seal_per_chain`（`WHERE status = 'active'`）兜底同一链至多一个
-   生效封存；直接移交、邀约创建/替换/确认都在各自立即事务的任何写入之前检查生效
+   生效封存；直接移交、批量移交、邀约创建/替换/确认都在各自立即事务的任何写入之前检查生效
    封存并返回 409 `chain_on_hold`，与封存创建共用同一把写锁——封存先提交则操作
    全部落败且不写事件/新邀约，操作先提交则封存因链尾推进（`tail_mismatch`）落败，
    并发双方至多一个成功；封存与解封均不追加哈希链事件，CHECK 约束还保证

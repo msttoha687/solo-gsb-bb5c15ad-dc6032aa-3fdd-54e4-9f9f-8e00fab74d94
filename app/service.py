@@ -14,6 +14,15 @@
 
 交出方由服务端依据链尾持有人（current_holder）确定，客户端不能伪造。
 
+批量移交（POST /handover-batches）
+----------------------------------
+同一批文件对应的 2～20 条交接链可一次移交给同一接收方：请求携带统一的
+receiver 与每条链各自的 chain_id / tail_hash / nonce（同批 chain_id 不得
+重复）。全部链的校验（链存在 -> 无生效封存 -> 链尾匹配 -> 随机数查重）与
+事件追加、链尾推进都在**同一个** SQLite 立即事务内完成；任一链校验失败
+（不存在 404；链尾过期、随机数重放、封存生效 409）整批回滚，任何链都不
+新增事件。成功响应按请求顺序返回每条链的新序号与新链尾。
+
 待接收移交（邀约）流程
 ----------------------
 1. 持有人以最新 tail_hash 发起邀约（指定 receiver、有效期、一次性确认码，
@@ -42,11 +51,12 @@
   任何查询响应都不返回该摘要。
 - 同一链同时只能有一个生效封存：部分唯一索引 uq_active_seal_per_chain 与
   BEGIN IMMEDIATE 立即事务共同保证，重复封存返回 409 chain_seal_active。
-- 封存生效期间（存储态 active 且未过期），直接移交（POST /handovers）以及
-  邀约的创建（POST /offers）、替换（POST /offers/{id}/replace）、确认
-  （POST /offers/{id}/confirm）都在各自现有的 SQLite 立即事务内最前置校验
-  封存并返回 409 chain_on_hold，且绝不写入事件或新邀约；封存创建与这些
-  操作共用同一把写锁与同一立即事务语义，并发时只有一方成功。
+- 封存生效期间（存储态 active 且未过期），直接移交（POST /handovers）、
+  批量移交（POST /handover-batches）以及邀约的创建（POST /offers）、替换
+  （POST /offers/{id}/replace）、确认（POST /offers/{id}/confirm）都在各自
+  现有的 SQLite 立即事务内最前置校验封存并返回 409 chain_on_hold，且绝不
+  写入事件或新邀约；封存创建与这些操作共用同一把写锁与同一立即事务语义，
+  并发时只有一方成功。
 - 封存行不写任何哈希链事件，不影响链条可验证性。
 - 提前解封（POST /seals/{seal_id}/release）：凭一次性解封码在立即事务内把
   封存置为 released；解封码错误返回 403 release_code_mismatch；封存已解封
@@ -394,6 +404,79 @@ def append_handover(
         result = _append_handover_tx(conn, chain, receiver, nonce)
 
     return result
+
+
+def append_handover_batch(
+    receiver: str, items: list[dict[str, str]]
+) -> dict[str, Any]:
+    """把同一批文件对应的 2～20 条交接链一次移交给同一接收方，整体原子。
+
+    与单链移交共用同一套哈希计算、随机数查重与封存门禁，且全部工作在
+    **同一个** SQLite 立即事务（BEGIN IMMEDIATE）内完成：按请求顺序逐链校验
+    「链条存在 -> 无生效封存 -> 携带的链尾仍是当前链尾 -> 随机数未在该链
+    重放」，全部通过后才逐链追加移交事件并推进各链尾（每条链的交出方仍按
+    其各自的当前持有人确定）。任一链不存在（404）、链尾过期/不匹配、随机数
+    重放或处于封存生效期（409）时整批回滚——任何链都不新增事件，不会出现
+    部分链推进的半批次结果。成功时按请求顺序返回每条链的新序号与新链尾。
+
+    同批 chain_id 不得重复，重复返回 400 duplicate_chain_id；随机数查重以
+    (chain_id, nonce) 为域，不同链之间允许使用相同 nonce。
+    """
+    chain_ids = [item["chain_id"] for item in items]
+    if len(set(chain_ids)) != len(chain_ids):
+        raise ChainError(
+            400,
+            "duplicate_chain_id",
+            "同批 chain_id 不得重复：同一批移交中每条链只能出现一次",
+        )
+
+    results: list[dict[str, Any]] = []
+    with write_tx() as conn:
+        for item in items:
+            chain_id = item["chain_id"]
+            tail_hash = item["tail_hash"]
+            nonce = item["nonce"]
+
+            chain = conn.execute(
+                "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
+            ).fetchone()
+            if chain is None:
+                raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+
+            # 封存门禁：与单链移交一致且最前置，命中即整批失败、不写任何事件。
+            _raise_if_chain_on_hold(conn, chain_id)
+
+            if chain["tail_hash"] != tail_hash:
+                raise ChainError(
+                    409,
+                    "tail_mismatch",
+                    f"链 {chain_id} 的链尾哈希不匹配：链条已被其他移交推进，"
+                    "请获取最新链尾后重试（本次批量移交整体失败，未写入任何事件）",
+                )
+
+            # UNIQUE(chain_id, nonce) 是最终防线；这里先给出明确错误信息。
+            dup = conn.execute(
+                "SELECT seq FROM events WHERE chain_id = ? AND nonce = ? AND seq > 0",
+                (chain_id, nonce),
+            ).fetchone()
+            if dup is not None:
+                raise ChainError(
+                    409,
+                    "nonce_replay",
+                    f"链 {chain_id} 的随机数已被使用（重放被拒绝），首次出现于"
+                    f"序号 {dup['seq']}（本次批量移交整体失败，未写入任何事件）",
+                )
+
+            appended = _append_handover_tx(conn, chain, receiver, nonce)
+            results.append(
+                {
+                    "chain_id": chain_id,
+                    "seq": appended["seq"],
+                    "tail_hash": appended["tail_hash"],
+                }
+            )
+
+    return {"receiver": receiver, "results": results}
 
 
 def _load_witnesses(
@@ -1582,10 +1665,10 @@ def _raise_if_chain_on_hold(
 ) -> None:
     """在已开启的写事务内检查封存门禁：存在生效封存即抛 409 chain_on_hold。
 
-    直接移交、邀约创建/替换/确认在各自的立即事务内、任何写入之前调用本函数，
-    与封存创建共用同一把写锁与 BEGIN IMMEDIATE 语义：封存创建先提交则后续操作
-    看到 active 行而失败；操作先提交则封存创建看到推进后的链尾（链尾不匹配）
-    或直接在唯一索引上失败——竞争双方至多一个成功。
+    直接移交、批量移交、邀约创建/替换/确认在各自的立即事务内、任何写入之前
+    调用本函数，与封存创建共用同一把写锁与 BEGIN IMMEDIATE 语义：封存创建先
+    提交则后续操作看到 active 行而失败；操作先提交则封存创建看到推进后的链尾
+    （链尾不匹配）或直接在唯一索引上失败——竞争双方至多一个成功。
     """
     now = now or _now_dt()
     seal = conn.execute(
@@ -1599,8 +1682,8 @@ def _raise_if_chain_on_hold(
         raise ChainError(
             409,
             "chain_on_hold",
-            "链条处于争议封存生效期：直接移交与邀约的创建、替换、确认均被冻结，"
-            "请由持有人凭解封码提前解封或等待封存到期",
+            "链条处于争议封存生效期：直接移交、批量移交与邀约的创建、替换、确认"
+            "均被冻结，请由持有人凭解封码提前解封或等待封存到期",
         )
 
 

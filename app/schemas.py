@@ -133,6 +133,57 @@ class HandoverRequest(BaseModel):
         return v
 
 
+class HandoverBatchItem(BaseModel):
+    """批量移交中的单条链：各自的链 ID、认定的当前链尾与一次性随机数。"""
+
+    chain_id: str = Field(..., description="交接链 ID")
+    tail_hash: str = Field(..., description="客户端认定的该链当前链尾哈希")
+    nonce: str = Field(..., description="一次性随机数，同一链内不可重复（防重放）")
+
+    @field_validator("chain_id")
+    @classmethod
+    def _check_chain_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("chain_id 不能为空")
+        return v
+
+    @field_validator("tail_hash")
+    @classmethod
+    def _check_tail_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "tail_hash")
+
+    @field_validator("nonce")
+    @classmethod
+    def _check_nonce(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("nonce 不能为空（一次性随机数）")
+        if len(v) > _NONCE_MAX:
+            raise ValueError(f"nonce 长度不能超过 {_NONCE_MAX}")
+        return v
+
+
+class HandoverBatchRequest(BaseModel):
+    """POST /handover-batches 请求体：同一批文件的多条链一次移交给同一接收方。"""
+
+    receiver: str = Field(..., description="本批全部链的统一接收方标识")
+    items: list[HandoverBatchItem] = Field(
+        ...,
+        min_length=2,
+        max_length=20,
+        description=(
+            "待移交的链列表（2～20 条，按请求顺序校验、追加并返回）；"
+            "同批 chain_id 不得重复"
+        ),
+    )
+
+    @field_validator("receiver")
+    @classmethod
+    def _check_receiver(cls, v: str) -> str:
+        return _validate_name(v, "receiver")
+
+
 class EventOut(BaseModel):
     seq: int
     prev_hash: str
@@ -223,6 +274,27 @@ class HandoverResult(BaseModel):
     canonical: str
     tail_hash: str
     current_holder: str
+
+
+class HandoverBatchItemResult(BaseModel):
+    """批量移交中单条链的移交结果（与请求条目同序返回）。"""
+
+    chain_id: str
+    seq: int = Field(..., description="该链新追加移交事件的序号")
+    tail_hash: str = Field(
+        ..., description="该链推进后的新链尾哈希（即新事件哈希）"
+    )
+
+
+class HandoverBatchResult(BaseModel):
+    receiver: str = Field(..., description="本批全部链的统一接收方标识")
+    results: list[HandoverBatchItemResult] = Field(
+        ...,
+        description=(
+            "各链移交结果，与请求 items 同序；任一链校验失败则整批回滚，"
+            "不返回本响应（任何链都不新增事件）"
+        ),
+    )
 
 
 class VerifyResult(BaseModel):
