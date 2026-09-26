@@ -24,6 +24,17 @@
   服务端在**同一个 SQLite 立即事务**中完成「校验链尾 → 查重随机数 → 追加事件 →
   推进链尾」，全程串行。链尾不匹配（过期/竞争请求）或随机数重放一律返回
   **`409 Conflict`**，不写入任何数据，因而不可能产生分叉。
+- **批量移交** `POST /handover-batches`：把同一批文件对应的 **2～20 条**交接链
+  **一次性移交给同一接收方**。请求携带 `receiver` 与每条链的 `chain_id`、
+  `tail_hash`、`nonce`（**同批 `chain_id` 不得重复**，重复或条数不在 2～20
+  范围内返回 422；各链随机数相互独立）。服务端在**同一个 SQLite 立即事务**内
+  按请求顺序逐链完成与单链移交**完全一致**的「存在性 → 封存门禁 → 链尾匹配 →
+  随机数查重 → 追加事件 → 推进链尾」（哈希计算、随机数查重与生效封存限制全部
+  复用单链移交）；**任一链**不存在（404）、处于封存生效期（409
+  `chain_on_hold`）、链尾过期（409 `tail_mismatch`）或随机数重放（409
+  `nonce_replay`）时**整批失败、整体回滚——包括本来可以成功的链在内，任何链都
+  不新增事件**。全部成功才整体提交，响应 `results` **按请求顺序**返回每条链的新
+  序号 `seq` 与新链尾 `tail_hash`。
 - **待接收移交（邀约确认）**：除直接移交外，持有人也可先发起邀约、由接收方确认：
   1. **发起邀约** `POST /offers`：携带当前 `tail_hash`、指定的 `receiver`、
      有效期 `expires_in_seconds`（秒，上限 7 天）与一次性确认码
@@ -270,6 +281,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `POST` | `/chains` | 创建交接链（文件摘要 + 首位持有人） |
 | `POST` | `/handovers` | 执行一次移交（链尾哈希 + 接收方 + 一次性随机数） |
+| `POST` | `/handover-batches` | 批量移交：同一批 2～20 条链（同批 chain_id 不得重复）在一个立即事务内整批校验并追加事件、推进各链尾给同一接收方；任一链不存在/封存生效/链尾过期/随机数重放则整批回滚，任何链不新增事件；响应按请求顺序返回各链新 seq 与 tail_hash |
 | `POST` | `/offers` | 发起邀约（链尾 + 接收方 + 有效期 + 一次性确认码；可选撤销码，凭码可撤销/替换；可选 2～5 名见证人与阈值） |
 | `POST` | `/offers/{offer_id}/confirm` | 接收方凭确认码确认，原子追加移交事件（见证模式须无拒绝且同意数达阈值） |
 | `POST` | `/offers/{offer_id}/cancel` | 凭一次性撤销码撤销邀约（仅 pending 且链尾未推进/未过期/无拒绝；错码 403，终态或无撤销码 409；不改链） |
@@ -332,6 +344,12 @@ chain_id/holder/role/created_from/created_to 不符；**不会回退为新查询
 对从未有过封存的链查询最新封存 `seal_not_found`、查询 Merkle 证明时事件序号
 越界（含负数）`event_not_found`（单事件与批量证明一致）。
 
+批量移交 `POST /handover-batches` **不引入新错误码**：复用单链移交的 404
+`not_found`、409 `chain_on_hold` / `tail_mismatch` / `nonce_replay`，任一链
+命中即整批回滚（包括本来可以成功的链），错误 `detail` 中附带首个失败链的
+`chain_id`；同批 `chain_id` 重复、条数不在 2～20 或字段格式非法为请求级
+**422**。
+
 ## 使用示例
 
 ```bash
@@ -365,6 +383,52 @@ curl -s http://localhost:8000/chains/ab12...
 
 # 6) 完整性校验（正常：valid=true）
 curl -s http://localhost:8000/chains/ab12.../verify
+```
+
+### 批量移交示例
+
+适用于「同一批文件的多条交接链，一次性移交给同一接收方」的场景：2～20 条链的
+校验与追加在**同一个 SQLite 立即事务**内完成，任一链失败则整批回滚。
+
+```bash
+# 1) 假设 chain A（aaaa...，当前链尾 tailA）与 chain B（bbbb...，当前链尾 tailB）
+#    都由当前持有人持有，现把两条链一次性移交给同一接收方 carol
+curl -s -X POST http://localhost:8000/handover-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"receiver":"carol",
+       "items":[
+         {"chain_id":"aaaa...","tail_hash":"<A 当前链尾>","nonce":"batch-001-a"},
+         {"chain_id":"bbbb...","tail_hash":"<B 当前链尾>","nonce":"batch-001-b"}]}'
+# 201 响应：results 严格按请求顺序，给出每条链的新序号与新链尾
+# {"receiver":"carol","count":2,
+#  "results":[{"chain_id":"aaaa...","seq":4,"tail_hash":"<A 新链尾>"},
+#             {"chain_id":"bbbb...","seq":2,"tail_hash":"<B 新链尾>"}]}
+# 两条链的当前持有人都变为 carol；下一次各自移交必须携带返回的新链尾
+
+# 2) 整批原子：第二条链的链尾过期 -> 409 tail_mismatch，
+#    第一条链本来可以成功也不会写入任何事件，两条链的链尾都保持不变
+curl -i -X POST http://localhost:8000/handover-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"receiver":"carol",
+       "items":[
+         {"chain_id":"aaaa...","tail_hash":"<A 当前链尾>","nonce":"batch-002-a"},
+         {"chain_id":"bbbb...","tail_hash":"<过期的旧链尾>","nonce":"batch-002-b"}]}'
+# 409 {"error":"tail_mismatch",
+#      "detail":"链 bbbb... 的链尾哈希不匹配：链条已被其他移交推进，整批未生效，请获取最新链尾后重试"}
+# 随即查询 /chains/aaaa... 可确认其事件数与链尾与调用前完全一致
+
+# 3) 任一链随机数重放（nonce 在该链内用过）-> 409 nonce_replay，同样整批回滚；
+#    任一链处于封存生效期 -> 409 chain_on_hold；任一 chain_id 不存在 -> 404 not_found
+
+# 4) 请求级校验（均为 422，不进入事务）：
+#    同批 chain_id 重复 / 条数不在 2～20 / tail_hash 非 64 位十六进制 / nonce 为空
+curl -i -X POST http://localhost:8000/handover-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"receiver":"carol",
+       "items":[
+         {"chain_id":"aaaa...","tail_hash":"<A 当前链尾>","nonce":"x1"},
+         {"chain_id":"aaaa...","tail_hash":"<A 当前链尾>","nonce":"x2"}]}'
+# 422（同批 chain_id 不得重复）；注意各链 nonce 相互独立，不同链允许相同 nonce
 ```
 
 ### 待接收移交（邀约确认）示例
@@ -749,7 +813,10 @@ curl -i "http://localhost:8000/chains/ab12.../events/proof?seq=0&seq=1&...&seq=2
 ## 防分叉与并发保证
 
 1. 每次追加都在 `BEGIN IMMEDIATE` 事务内完成，且进程内写操作由互斥锁串行化；
-   「读链尾 → 比对 → 插入 → 推进」是一个原子步骤。邀约确认同样如此：
+   「读链尾 → 比对 → 插入 → 推进」是一个原子步骤。**批量移交
+   （`POST /handover-batches`）同样如此：同一批 2～20 条链的「逐链校验 → 追加
+   事件 → 推进各链尾」全部在同一个立即事务内按请求顺序完成，任一链校验失败即
+   整批回滚，任何链都不新增事件。**邀约确认同样如此：
    「验码 → 未过期 → 未使用 → 未撤销 → 链尾匹配 → （见证模式）无拒绝且同意数
    达阈值 → 追加事件 → 置 accepted」全部在同一立即事务内，任一校验失败即整体
    回滚。**邀约撤销、原子替换、接收方确认与见证人表态共用同一把写锁与同一立即

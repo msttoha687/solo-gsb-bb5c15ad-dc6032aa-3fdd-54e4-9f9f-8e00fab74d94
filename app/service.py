@@ -14,6 +14,17 @@
 
 交出方由服务端依据链尾持有人（current_holder）确定，客户端不能伪造。
 
+批量移交（POST /handover-batches）
+---------------------------------
+把同一批文件对应的 2～20 条交接链一次移交给同一接收方：请求携带 receiver 与
+每条链的 chain_id / tail_hash / nonce（同批 chain_id 不得重复，由请求模型
+保证）。服务端在**同一个** SQLite 立即事务内按请求顺序逐链完成与单链移交
+完全一致的「存在性 → 封存门禁 → 链尾匹配 → 随机数查重 → 追加事件 → 推进
+链尾」，全部成功才整体提交；任一链不存在（404 not_found）、处于争议封存
+生效期（409 chain_on_hold）、链尾不匹配（409 tail_mismatch）或随机数
+重放（409 nonce_replay）时整批回滚——**任何链都不新增事件**。成功响应按
+请求顺序返回每条链的新序号与新链尾。
+
 待接收移交（邀约）流程
 ----------------------
 1. 持有人以最新 tail_hash 发起邀约（指定 receiver、有效期、一次性确认码，
@@ -394,6 +405,66 @@ def append_handover(
         result = _append_handover_tx(conn, chain, receiver, nonce)
 
     return result
+
+
+def append_handover_batch(
+    receiver: str, items: list[dict[str, str]]
+) -> dict[str, Any]:
+    """把同一批 2～20 条交接链一次性移交给同一接收方（整批原子）。
+
+    与单链移交（append_handover）复用同一套校验与哈希规则：所有链的「存在性
+    -> 封存门禁 -> 链尾匹配 -> 随机数查重 -> 追加事件 -> 推进链尾」都在
+    **同一个** SQLite 立即事务内按请求顺序完成。任一链不存在（404）、处于
+    争议封存生效期（409 chain_on_hold）、链尾不匹配（409 tail_mismatch）或
+    随机数重放（409 nonce_replay）时抛出 ChainError，整个事务回滚——**任何
+    链都不新增事件**，整批失败；全部链校验并追加成功才整体提交。同批
+    chain_id 互不重复（由请求模型保证），各链在本事务内互不干扰，每条链都
+    沿用 _append_handover_tx 的哈希计算与唯一约束兜底。
+    """
+    results: list[dict[str, Any]] = []
+    with write_tx() as conn:
+        for item in items:
+            chain_id = item["chain_id"]
+            chain = conn.execute(
+                "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
+            ).fetchone()
+            if chain is None:
+                raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+
+            # 封存门禁：与单链移交一致，最前置校验；任一链处于封存生效期整批失败。
+            _raise_if_chain_on_hold(conn, chain_id)
+
+            if chain["tail_hash"] != item["tail_hash"]:
+                raise ChainError(
+                    409,
+                    "tail_mismatch",
+                    f"链 {chain_id} 的链尾哈希不匹配：链条已被其他移交推进，"
+                    "整批未生效，请获取最新链尾后重试",
+                )
+
+            # UNIQUE(chain_id, nonce) 是最终防线；这里先给出明确错误信息。
+            dup = conn.execute(
+                "SELECT seq FROM events WHERE chain_id = ? AND nonce = ? AND seq > 0",
+                (chain_id, item["nonce"]),
+            ).fetchone()
+            if dup is not None:
+                raise ChainError(
+                    409,
+                    "nonce_replay",
+                    f"链 {chain_id} 的随机数已被使用（重放被拒绝，首次出现于序号 "
+                    f"{dup['seq']}），整批未生效",
+                )
+
+            result = _append_handover_tx(conn, chain, receiver, item["nonce"])
+            results.append(
+                {
+                    "chain_id": chain_id,
+                    "seq": result["seq"],
+                    "tail_hash": result["tail_hash"],
+                }
+            )
+
+    return {"receiver": receiver, "count": len(results), "results": results}
 
 
 def _load_witnesses(

@@ -16,6 +16,8 @@ _SEAL_TTL_MAX = 30 * 24 * 3600  # 争议封存有效期上限：30 天
 _REASON_MAX = 1000
 _WITNESS_MIN = 2
 _WITNESS_MAX = 5
+_HANDOVER_BATCH_MIN = 2
+_HANDOVER_BATCH_MAX = 20
 
 def _validate_name(value: str, field: str) -> str:
     value = value.strip()
@@ -133,6 +135,66 @@ class HandoverRequest(BaseModel):
         return v
 
 
+class HandoverBatchItem(BaseModel):
+    """批量移交请求中的单条链：链 ID、客户端认定的当前链尾与一次性随机数。"""
+
+    chain_id: str = Field(..., description="交接链 ID（同批内不得重复）")
+    tail_hash: str = Field(..., description="客户端认定的该链当前链尾哈希")
+    nonce: str = Field(
+        ..., description="一次性随机数，该链内不可重复（防重放）；不同链相互独立"
+    )
+
+    @field_validator("chain_id")
+    @classmethod
+    def _check_chain_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("chain_id 不能为空")
+        return v
+
+    @field_validator("tail_hash")
+    @classmethod
+    def _check_tail_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "tail_hash")
+
+    @field_validator("nonce")
+    @classmethod
+    def _check_nonce(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("nonce 不能为空（一次性随机数）")
+        if len(v) > _NONCE_MAX:
+            raise ValueError(f"nonce 长度不能超过 {_NONCE_MAX}")
+        return v
+
+
+class HandoverBatchRequest(BaseModel):
+    """POST /handover-batches 请求体：同一接收方 + 2～20 条不重复的链。"""
+
+    receiver: str = Field(..., description="同一接收方标识（整批共用）")
+    items: list[HandoverBatchItem] = Field(
+        ...,
+        min_length=_HANDOVER_BATCH_MIN,
+        max_length=_HANDOVER_BATCH_MAX,
+        description=(
+            f"同批移交的链（{_HANDOVER_BATCH_MIN}～{_HANDOVER_BATCH_MAX} 条，"
+            "chain_id 不得重复）"
+        ),
+    )
+
+    @field_validator("receiver")
+    @classmethod
+    def _check_receiver(cls, v: str) -> str:
+        return _validate_name(v, "receiver")
+
+    @model_validator(mode="after")
+    def _check_unique_chain_ids(self) -> "HandoverBatchRequest":
+        ids = [item.chain_id for item in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("同批 chain_id 不得重复")
+        return self
+
+
 class EventOut(BaseModel):
     seq: int
     prev_hash: str
@@ -223,6 +285,26 @@ class HandoverResult(BaseModel):
     canonical: str
     tail_hash: str
     current_holder: str
+
+
+class HandoverBatchResultItem(BaseModel):
+    """批量移交结果中的单条链：新序号与推进后的新链尾哈希。"""
+
+    chain_id: str
+    seq: int = Field(..., description="该链新追加移交事件的序号")
+    tail_hash: str = Field(
+        ..., description="该链推进后的新链尾哈希（即新事件哈希）"
+    )
+
+
+class HandoverBatchResult(BaseModel):
+    receiver: str = Field(..., description="整批共用的接收方标识")
+    count: int = Field(
+        ..., description="本批成功移交的链数（等于请求 items 条数，2～20）"
+    )
+    results: list[HandoverBatchResultItem] = Field(
+        ..., description="各链移交结果，严格按请求 items 顺序"
+    )
 
 
 class VerifyResult(BaseModel):

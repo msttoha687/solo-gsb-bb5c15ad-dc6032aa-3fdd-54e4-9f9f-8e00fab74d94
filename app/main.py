@@ -17,6 +17,8 @@ from .schemas import (
     CreateChainRequest,
     EventBatchProofOut,
     EventProofOut,
+    HandoverBatchRequest,
+    HandoverBatchResult,
     HandoverRequest,
     HandoverResult,
     HealthOut,
@@ -41,6 +43,7 @@ from .schemas import (
 from .service import (
     ChainError,
     append_handover,
+    append_handover_batch,
     cancel_offer,
     confirm_offer,
     create_chain,
@@ -73,7 +76,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="文件交接留痕服务",
     description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -201,6 +204,32 @@ def api_create_chain(req: CreateChainRequest) -> ChainOut:
 def api_handover(req: HandoverRequest) -> HandoverResult:
     return HandoverResult(
         **append_handover(req.chain_id, req.tail_hash, req.receiver, req.nonce)
+    )
+
+
+@app.post(
+    "/handover-batches",
+    response_model=HandoverBatchResult,
+    status_code=201,
+    tags=["chains"],
+    summary="批量移交：同一批 2～20 条链一次移交给同一接收方（整批原子）",
+    description=(
+        "请求携带同一 receiver 与每条链的 chain_id、tail_hash、nonce"
+        "（2～20 条，同批 chain_id 不得重复，重复或条数越界返回 422）。"
+        "服务端在同一个 SQLite 立即事务内按请求顺序逐链完成与单链移交一致的"
+        "校验（存在性 → 封存门禁 → 链尾匹配 → 随机数查重）并追加事件、推进"
+        "各链尾：任一链不存在（404）、处于封存生效期（409 chain_on_hold）、"
+        "链尾过期（409 tail_mismatch）或随机数重放（409 nonce_replay）时"
+        "**整批失败、整体回滚，任何链都不新增事件**。全部成功才整体提交，"
+        "成功响应 results 按请求 items 顺序返回每条链的新序号 seq 与新链尾 "
+        "tail_hash（哈希规则与单链移交完全相同）。"
+    ),
+)
+def api_handover_batch(req: HandoverBatchRequest) -> HandoverBatchResult:
+    return HandoverBatchResult(
+        **append_handover_batch(
+            req.receiver, [item.model_dump() for item in req.items]
+        )
     )
 
 
